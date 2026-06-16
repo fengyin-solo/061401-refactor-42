@@ -1,27 +1,23 @@
-import { ref, computed, watch } from 'vue'
-import type { GameState, LogEntry, RandomEvent, ActionType, ActionEffect } from '@/types/game'
-import { randomEvents } from '@/data/events'
+import { ref, computed } from 'vue'
+import type { GameState, LogEntry, ActionType, LogType } from '@/types/game'
+import {
+  canPerformAction as engineCanPerformAction,
+  getActionDefinition,
+  applyEffectsToState,
+  checkGameOverCondition,
+  getRandomEvent,
+  getEventLogType,
+} from '@/composables/gameEngine'
 
 const STORAGE_KEY_HIGH_SCORE = 'survival_game_high_score'
-const MAX_STAT = 100
 
-const actionEffects: Record<ActionType, ActionEffect> = {
-  gatherWood: {
-    health: -5, hunger: 5, thirst: 3, wood: 10, stone: 0 },
-  gatherStone: {
-    health: -8, hunger: 6, thirst: 4, wood: 0, stone: 8 },
-  hunt: {
-    health: 15, hunger: -20, thirst: 5, wood: -5, stone: 0 },
-  drink: {
-    health: 0, hunger: 2, thirst: -25, wood: -3, stone: 0 },
+interface ActionContext {
+  action: ActionType
+  state: GameState
+  logs: Array<{ text: string; type: LogType }>
 }
 
-const actionNames: Record<ActionType, string> = {
-  gatherWood: '采集木头',
-  gatherStone: '采集石头',
-  hunt: '打猎',
-  drink: '喝水',
-}
+type PipelineStep = (ctx: ActionContext) => boolean | void
 
 export function useGame() {
   const state = ref<GameState>({
@@ -74,69 +70,77 @@ export function useGame() {
     }
   }
 
-  function clampStat(value: number, min: number, max: number): number {
-    return Math.max(min, Math.min(max, value))
+  function flushLogs(ctx: ActionContext) {
+    for (const log of ctx.logs) {
+      addLog(log.text, log.type)
+    }
+    ctx.logs = []
   }
 
-  function applyEffects(effects: ActionEffect) {
-    if (effects.health !== undefined) {
-      state.value.health = clampStat(state.value.health + effects.health, 0, MAX_STAT)
-    }
-    if (effects.hunger !== undefined) {
-      state.value.hunger = clampStat(state.value.hunger + effects.hunger, 0, MAX_STAT)
-    }
-    if (effects.thirst !== undefined) {
-      state.value.thirst = clampStat(state.value.thirst + effects.thirst, 0, MAX_STAT)
-    }
-    if (effects.wood !== undefined) {
-      state.value.wood = Math.max(0, state.value.wood + effects.wood)
-    }
-    if (effects.stone !== undefined) {
-      state.value.stone = Math.max(0, state.value.stone + effects.stone)
-    }
+  const validateStep: PipelineStep = (ctx) => {
+    return canPerformAction(ctx.action)
   }
 
-  function getRandomEvent(): RandomEvent {
-    const index = Math.floor(Math.random() * randomEvents.length)
-    return randomEvents[index]
+  const applyActionEffectsStep: PipelineStep = (ctx) => {
+    const definition = getActionDefinition(ctx.action)
+    applyEffectsToState(ctx.state, definition.effects)
+    ctx.state.turn++
+    ctx.logs.push({
+      text: `第 ${ctx.state.turn} 回合：${definition.name}`,
+      type: 'action',
+    })
   }
 
-  function checkGameOver() {
-    if (state.value.health <= 0 || state.value.hunger >= MAX_STAT || state.value.thirst >= MAX_STAT) {
-      state.value.isGameOver = true
+  const triggerRandomEventStep: PipelineStep = (ctx) => {
+    const event = getRandomEvent()
+    applyEffectsToState(ctx.state, event.effects)
+    ctx.logs.push({
+      text: event.text,
+      type: getEventLogType(event),
+    })
+  }
+
+  const checkGameOverStep: PipelineStep = (ctx) => {
+    if (checkGameOverCondition(ctx.state)) {
+      ctx.state.isGameOver = true
       saveHighScore()
-      addLog('你没能在荒野中生存下来...', 'system')
+      ctx.logs.push({
+        text: '你没能在荒野中生存下来...',
+        type: 'system',
+      })
     }
+  }
+
+  const actionPipeline: PipelineStep[] = [
+    validateStep,
+    applyActionEffectsStep,
+    triggerRandomEventStep,
+    checkGameOverStep,
+  ]
+
+  function executeActionPipeline(action: ActionType) {
+    const ctx: ActionContext = {
+      action,
+      state: state.value,
+      logs: [],
+    }
+
+    for (const step of actionPipeline) {
+      const result = step(ctx)
+      if (result === false) {
+        return
+      }
+    }
+
+    flushLogs(ctx)
   }
 
   function canPerformAction(action: ActionType): boolean {
-    if (state.value.isGameOver) return false
-    const effects = actionEffects[action]
-    if (effects.wood !== undefined && state.value.wood + effects.wood < 0) {
-      return false
-    }
-    if (effects.stone !== undefined && state.value.stone + effects.stone < 0) {
-      return false
-    }
-    return true
+    return engineCanPerformAction(state.value, action)
   }
 
   function performAction(action: ActionType) {
-    if (!canPerformAction(action)) return
-
-    const effects = actionEffects[action]
-    applyEffects(effects)
-    state.value.turn++
-
-    addLog(`第 ${state.value.turn} 回合：${actionNames[action]}`, 'action')
-
-    const event = getRandomEvent()
-    applyEffects(event.effects)
-
-    const eventLogType = event.type === 'good' ? 'good' : event.type === 'bad' ? 'bad' : 'event'
-    addLog(event.text, eventLogType)
-
-    checkGameOver()
+    executeActionPipeline(action)
   }
 
   function gatherWood() {
